@@ -1,0 +1,145 @@
+diff --git a/Core/Src/main.c b/Core/Src/main.c
+--- a/Core/Src/main.c
++++ b/Core/Src/main.c
+@@ -30,6 +30,7 @@
+ #include <math.h>
+ #include <stm32f407xx.h>
+ #include <string.h>
++#include "nlms_square_protect.h"
+ /* USER CODE END Includes */
+ 
+ /* Private typedef -----------------------------------------------------------*/
+@@ -57,6 +58,10 @@
+ #define NLMS_GAIN 1.98f
+ #define NLMS_EPS (1e-6f) //^ 滤波器 最小
+ 
++#define NLMS_SQUARE_PROTECT_ON 1
++#define NLMS_SQUARE_PROTECT_MU (0.01f)
++#define NLMS_SQUARE_PROTECT_FREQ_UPDATE_TH_HZ (1.0f)
++
+ #define HIGH_PASS_FILTER_ON 0 // 1: DAC 输出前经过高通滤波
+ #define NLMS_CUSTOM_INIT_ON 1 // 1: 使用 nlms_initial_w 初始化权重；0: 权重全 0
+ #define NLMS_INITIAL_W_SET 2 // 1: 使用 nlms_initial_w；2: 使用 nlms_initial_w_2
+@@ -226,6 +231,12 @@
+   uint8_t ref_square_freq_meter_active;
+   dynamic_notch_t ref_notch;
+   ref_square_detector_t ref_square_detector;
++
++  nlms_update_notch_t square_update_notch;
++  nlms_square_protect_config_t square_protect_cfg;
++  uint8_t square_protect_enabled;
++  float square_protect_mu_eff;
++  float square_protect_e_update;
+ } nlms32_t;
+ 
+ typedef struct {
+@@ -291,6 +302,11 @@
+ volatile uint32_t debug_ref_square_zero_cross_count = 0;
+ volatile float debug_ref_square_rms = 0.0f;
+ 
++volatile uint8_t debug_square_protect_enabled = 0;
++volatile float debug_square_protect_mu_eff = 0.0f;
++volatile float debug_square_protect_notch_freq_hz = 0.0f;
++volatile float debug_square_protect_e_update = 0.0f;
++
+ volatile uint32_t nlms_reset_led_until_tick = 0;
+ 
+ biquad_hp_t hp_filter;
+@@ -564,6 +580,17 @@
+   s->ref_square_freq_meter_active = 0;
+   dynamic_notch_init(&s->ref_notch);
+   ref_square_detector_init(&s->ref_square_detector);
++  nlms_square_protect_default_config(&s->square_protect_cfg, NLMS_MU,
++                                     NLMS_SQUARE_PROTECT_MU);
++  nlms_update_notch_init(&s->square_update_notch, NLMS_FREQ_SAMPLE_RATE,
++                         s->square_protect_cfg.notch_r);
++  s->square_protect_enabled = 0;
++  s->square_protect_mu_eff = NLMS_MU;
++  s->square_protect_e_update = 0.0f;
++  debug_square_protect_enabled = 0;
++  debug_square_protect_mu_eff = NLMS_MU;
++  debug_square_protect_notch_freq_hz = 0.0f;
++  debug_square_protect_e_update = 0.0f;
+ }
+ 
+ void nlms32_reset(nlms32_t *s) {
+@@ -586,6 +613,17 @@
+   s->ref_square_freq_meter_active = 0;
+   dynamic_notch_init(&s->ref_notch);
+   ref_square_detector_init(&s->ref_square_detector);
++  nlms_square_protect_default_config(&s->square_protect_cfg, NLMS_MU,
++                                     NLMS_SQUARE_PROTECT_MU);
++  nlms_update_notch_init(&s->square_update_notch, NLMS_FREQ_SAMPLE_RATE,
++                         s->square_protect_cfg.notch_r);
++  s->square_protect_enabled = 0;
++  s->square_protect_mu_eff = NLMS_MU;
++  s->square_protect_e_update = 0.0f;
++  debug_square_protect_enabled = 0;
++  debug_square_protect_mu_eff = NLMS_MU;
++  debug_square_protect_notch_freq_hz = 0.0f;
++  debug_square_protect_e_update = 0.0f;
+ }
+ 
+ void ref_square_detector_init(ref_square_detector_t *d) {
+@@ -1398,8 +1436,60 @@
+ 
+       e = d - y;
+ 
++      float e_update = e;
++      float mu_eff = s->mu;
++      uint8_t square_protect_enabled = 0U;
++
++#if NLMS_SQUARE_PROTECT_ON == 1
++      const uint8_t square_ratio_is_odd_harmonic =
++          (((square_nlms_freq_ratio > 2.90f) &&
++            (square_nlms_freq_ratio < 3.10f)) ||
++           ((square_nlms_freq_ratio > 4.80f) &&
++            (square_nlms_freq_ratio < 5.20f)))
++              ? 1U
++              : 0U;
++
++      const uint8_t square_protect_allowed =
++          (square_ratio_is_odd_harmonic == 0U) ? 1U : 0U;
++
++      if ((square_protect_allowed == 1U) &&
++          (nlms_square_protect_should_enable(
++               &s->square_protect_cfg, ref_noise_is_square,
++               debug_ref_square_freq_hz, debug_nlms_freq_hz,
++               debug_nlms_freq_confidence) == 1U)) {
++        if ((s->square_update_notch.valid == 0U) ||
++            (fabsf(debug_nlms_freq_hz -
++                   s->square_update_notch.notch_freq_hz) >
++             NLMS_SQUARE_PROTECT_FREQ_UPDATE_TH_HZ)) {
++          if (nlms_update_notch_set_freq(&s->square_update_notch,
++                                         debug_nlms_freq_hz) == 1U) {
++            nlms_update_notch_reset(&s->square_update_notch);
++          }
++        }
++
++        if (s->square_update_notch.valid == 1U) {
++          e_update = nlms_update_notch_process(&s->square_update_notch, e);
++          mu_eff = nlms_square_protect_mu(&s->square_protect_cfg, 1U);
++          square_protect_enabled = 1U;
++        }
++      } else {
++        s->square_update_notch.valid = 0U;
++        nlms_update_notch_reset(&s->square_update_notch);
++      }
++#endif
++
++      s->square_protect_enabled = square_protect_enabled;
++      s->square_protect_mu_eff = mu_eff;
++      s->square_protect_e_update = e_update;
++      debug_square_protect_enabled = square_protect_enabled;
++      debug_square_protect_mu_eff = mu_eff;
++      debug_square_protect_notch_freq_hz =
++          s->square_update_notch.valid ? s->square_update_notch.notch_freq_hz
++                                       : 0.0f;
++      debug_square_protect_e_update = e_update;
++
+       if (NLMS_FREEZE_W_ON == 0) {
+-        const float g = (s->mu * e) / (NLMS_EPS + norm);
++        const float g = (mu_eff * e_update) / (NLMS_EPS + norm);
+ 
+         for (int i = 0; i < NLMS_TAPS; i += 4) {
+           w[i + 0] += g * x[i + 0];
